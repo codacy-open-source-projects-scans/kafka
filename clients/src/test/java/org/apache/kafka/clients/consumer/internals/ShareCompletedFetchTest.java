@@ -60,6 +60,7 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class ShareCompletedFetchTest {
     private static final String TOPIC_NAME = "test";
@@ -246,8 +247,8 @@ public class ShareCompletedFetchTest {
 
                 // Record 1 then results in an empty batch
                 batch = completedFetch.fetchRecords(deserializers, 10, false);
-                assertEquals(RecordDeserializationException.class, batch.getException().getClass());
-                RecordDeserializationException thrown = (RecordDeserializationException) batch.getException();
+                assertEquals(RecordDeserializationException.class, batch.getException().cause().getClass());
+                RecordDeserializationException thrown = (RecordDeserializationException) batch.getException().cause();
                 assertEquals(RecordDeserializationException.DeserializationExceptionOrigin.KEY, thrown.origin());
                 assertEquals(1, thrown.offset());
                 assertEquals(TOPIC_NAME, thrown.topicPartition().topic());
@@ -264,8 +265,8 @@ public class ShareCompletedFetchTest {
 
                 // Record 2 then results in an empty batch, because record 1 has now been skipped
                 batch = completedFetch.fetchRecords(deserializers, 10, false);
-                assertEquals(RecordDeserializationException.class, batch.getException().getClass());
-                thrown = (RecordDeserializationException) batch.getException();
+                assertEquals(RecordDeserializationException.class, batch.getException().cause().getClass());
+                thrown = (RecordDeserializationException) batch.getException().cause();
                 assertEquals(RecordDeserializationException.DeserializationExceptionOrigin.VALUE, thrown.origin());
                 assertEquals(2L, thrown.offset());
                 assertEquals(TOPIC_NAME, thrown.topicPartition().topic());
@@ -356,6 +357,63 @@ public class ShareCompletedFetchTest {
         assertEquals(0, records.size());
     }
 
+    @Test
+    public void testOverlappingAcquiredRecordsLogsErrorAndRetainsFirstOccurrence() {
+        int startingOffset = 0;
+        int numRecords = 20;        // Records for 0-19
+
+        // Create overlapping acquired records: [0-9] and [5-14]
+        // Offsets 5-9 will be duplicates
+        List<ShareFetchResponseData.AcquiredRecords> acquiredRecords = new ArrayList<>();
+        acquiredRecords.add(new ShareFetchResponseData.AcquiredRecords()
+                .setFirstOffset(0L)
+                .setLastOffset(9L)
+                .setDeliveryCount((short) 1));
+        acquiredRecords.add(new ShareFetchResponseData.AcquiredRecords()
+                .setFirstOffset(5L)
+                .setLastOffset(14L)
+                .setDeliveryCount((short) 2));
+
+        ShareFetchResponseData.PartitionData partitionData = new ShareFetchResponseData.PartitionData()
+                .setRecords(newRecords(startingOffset, numRecords))
+                .setAcquiredRecords(acquiredRecords);
+
+        ShareCompletedFetch completedFetch = newShareCompletedFetch(partitionData);
+
+        Deserializers<String, String> deserializers = newStringDeserializers();
+
+        // Fetch records and verify that only 15 unique records are returned (0-14)
+        ShareInFlightBatch<String, String> batch = completedFetch.fetchRecords(deserializers, 20, true);
+        List<ConsumerRecord<String, String>> records = batch.getInFlightRecords();
+        
+        // Should get 15 unique records: 0-9 from first range (with deliveryCount=1)
+        // and 10-14 from second range (with deliveryCount=2)
+        assertEquals(15, records.size());
+        
+        // Verify first occurrence (offset 5 should have deliveryCount=1 from first range)
+        ConsumerRecord<String, String> record5 = records.stream()
+                .filter(r -> r.offset() == 5L)
+                .findFirst()
+                .orElse(null);
+        assertNotNull(record5);
+        assertEquals(Optional.of((short) 1), record5.deliveryCount());
+        
+        // Verify offset 10 has deliveryCount=2 from second range
+        ConsumerRecord<String, String> record10 = records.stream()
+                .filter(r -> r.offset() == 10L)
+                .findFirst()
+                .orElse(null);
+        assertNotNull(record10);
+        assertEquals(Optional.of((short) 2), record10.deliveryCount());
+        
+        // Verify all offsets are unique
+        Set<Long> offsetSet = new HashSet<>();
+        for (ConsumerRecord<String, String> record : records) {
+            assertTrue(offsetSet.add(record.offset()), 
+                    "Duplicate offset found in results: " + record.offset());
+        }
+    }
+
     private ShareCompletedFetch newShareCompletedFetch(ShareFetchResponseData.PartitionData partitionData) {
         LogContext logContext = new LogContext();
         ShareFetchMetricsRegistry shareFetchMetricsRegistry = new ShareFetchMetricsRegistry();
@@ -367,6 +425,7 @@ public class ShareCompletedFetchTest {
         return new ShareCompletedFetch(
                 logContext,
                 BufferSupplier.create(),
+                0,
                 TIP,
                 partitionData,
                 shareFetchMetricsAggregator,
@@ -374,11 +433,11 @@ public class ShareCompletedFetchTest {
     }
 
     private static Deserializers<UUID, UUID> newUuidDeserializers() {
-        return new Deserializers<>(new UUIDDeserializer(), new UUIDDeserializer());
+        return new Deserializers<>(new UUIDDeserializer(), new UUIDDeserializer(), null);
     }
 
     private static Deserializers<String, String> newStringDeserializers() {
-        return new Deserializers<>(new StringDeserializer(), new StringDeserializer());
+        return new Deserializers<>(new StringDeserializer(), new StringDeserializer(), null);
     }
 
     private Records newRecords(long baseOffset, int count) {

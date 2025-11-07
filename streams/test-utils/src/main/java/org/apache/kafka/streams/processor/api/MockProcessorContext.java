@@ -214,7 +214,7 @@ public class MockProcessorContext<KForward, VForward> implements ProcessorContex
         this(
             mkProperties(mkMap(
                 mkEntry(StreamsConfig.APPLICATION_ID_CONFIG, ""),
-                mkEntry(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, "")
+                mkEntry(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, "dummy-bootstrap-host:0")
             )),
             new TaskId(0, 0),
             null
@@ -256,6 +256,7 @@ public class MockProcessorContext<KForward, VForward> implements ProcessorContex
             new Metrics(metricConfig),
             threadId,
             "processId",
+            "applicationId",
             Time.SYSTEM
         );
         TaskMetrics.droppedRecordsSensor(threadId, taskId.toString(), metrics);
@@ -419,7 +420,7 @@ public class MockProcessorContext<KForward, VForward> implements ProcessorContex
     public List<CapturedForward<? extends KForward, ? extends VForward>> forwarded(final String childName) {
         final LinkedList<CapturedForward<? extends KForward, ? extends VForward>> result = new LinkedList<>();
         for (final CapturedForward<? extends KForward, ? extends VForward> capture : capturedForwards) {
-            if (!capture.childName().isPresent() || capture.childName().equals(Optional.of(childName))) {
+            if (capture.childName().isEmpty() || capture.childName().equals(Optional.of(childName))) {
                 result.add(capture);
             }
         }

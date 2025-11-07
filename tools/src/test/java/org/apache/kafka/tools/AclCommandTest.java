@@ -17,6 +17,7 @@
 package org.apache.kafka.tools;
 
 import org.apache.kafka.common.acl.AccessControlEntry;
+import org.apache.kafka.common.acl.AclBinding;
 import org.apache.kafka.common.acl.AclBindingFilter;
 import org.apache.kafka.common.acl.AclOperation;
 import org.apache.kafka.common.acl.AclPermissionType;
@@ -25,11 +26,10 @@ import org.apache.kafka.common.resource.Resource;
 import org.apache.kafka.common.resource.ResourcePattern;
 import org.apache.kafka.common.resource.ResourceType;
 import org.apache.kafka.common.security.auth.KafkaPrincipal;
+import org.apache.kafka.common.test.ClusterInstance;
 import org.apache.kafka.common.test.api.ClusterConfigProperty;
-import org.apache.kafka.common.test.api.ClusterInstance;
 import org.apache.kafka.common.test.api.ClusterTest;
 import org.apache.kafka.common.test.api.ClusterTestDefaults;
-import org.apache.kafka.common.test.api.ClusterTestExtensions;
 import org.apache.kafka.common.test.api.Type;
 import org.apache.kafka.common.utils.AppInfoParser;
 import org.apache.kafka.common.utils.Exit;
@@ -40,7 +40,6 @@ import org.apache.kafka.test.TestUtils;
 
 import org.apache.logging.log4j.Level;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.extension.ExtendWith;
 
 import java.io.File;
 import java.io.IOException;
@@ -67,6 +66,7 @@ import static org.apache.kafka.common.acl.AclOperation.DESCRIBE_CONFIGS;
 import static org.apache.kafka.common.acl.AclOperation.DESCRIBE_TOKENS;
 import static org.apache.kafka.common.acl.AclOperation.IDEMPOTENT_WRITE;
 import static org.apache.kafka.common.acl.AclOperation.READ;
+import static org.apache.kafka.common.acl.AclOperation.TWO_PHASE_COMMIT;
 import static org.apache.kafka.common.acl.AclOperation.WRITE;
 import static org.apache.kafka.common.acl.AclPermissionType.ALLOW;
 import static org.apache.kafka.common.acl.AclPermissionType.DENY;
@@ -80,6 +80,7 @@ import static org.apache.kafka.security.authorizer.AclEntry.WILDCARD_HOST;
 import static org.apache.kafka.server.config.ServerConfigs.AUTHORIZER_CLASS_NAME_CONFIG;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -91,7 +92,6 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
             @ClusterConfigProperty(key = AUTHORIZER_CLASS_NAME_CONFIG, value = AclCommandTest.STANDARD_AUTHORIZER)}
 
 )
-@ExtendWith(ClusterTestExtensions.class)
 public class AclCommandTest {
     public static final String STANDARD_AUTHORIZER = "org.apache.kafka.metadata.authorizer.StandardAuthorizer";
     private static final String LOCALHOST = "localhost:9092";
@@ -163,8 +163,8 @@ public class AclCommandTest {
             Set.of(READ, DESCRIBE, DELETE),
             List.of(OPERATION, "Read", OPERATION, "Describe", OPERATION, "Delete")),
         TRANSACTIONAL_ID_RESOURCES, Map.entry(
-            Set.of(DESCRIBE, WRITE),
-            List.of(OPERATION, "Describe", OPERATION, "Write")),
+            Set.of(DESCRIBE, WRITE, TWO_PHASE_COMMIT),
+            List.of(OPERATION, "Describe", OPERATION, "Write", OPERATION, "TwoPhaseCommit")),
         TOKEN_RESOURCES, Map.entry(
             Set.of(DESCRIBE),
             List.of(OPERATION, "Describe")),
@@ -275,6 +275,24 @@ public class AclCommandTest {
     @ClusterTest
     public void testPatternTypesWithAdminAPIAndBootstrapController(ClusterInstance cluster) {
         testPatternTypes(adminArgsWithBootstrapController(cluster.bootstrapControllers(), Optional.empty()));
+    }
+
+    @ClusterTest
+    public void testDuplicateAdd(ClusterInstance cluster) {
+        final String topicName = "test-topic";
+        final String principal = "User:Alice";
+        ResourcePattern resource = new ResourcePattern(ResourceType.TOPIC, topicName, PatternType.LITERAL);
+        AccessControlEntry ace = new AccessControlEntry(principal, WILDCARD_HOST, READ, ALLOW);
+        AclBinding binding = new AclBinding(resource, ace);
+        List<String> cmdArgs = adminArgs(cluster.bootstrapServers(), Optional.empty());
+        List<String> initialAddArgs = new ArrayList<>(cmdArgs);
+        initialAddArgs.addAll(List.of(ADD, TOPIC, topicName, "--allow-principal", principal, OPERATION, "Read"));
+
+        callMain(initialAddArgs);
+        String out = callMain(initialAddArgs).getKey();
+
+        assertTrue(out.contains("Acl " + binding + " already exists."));
+        assertFalse(out.contains("Adding ACLs for resource"));
     }
 
     @Test

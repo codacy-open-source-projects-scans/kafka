@@ -68,12 +68,12 @@ public class ShareSessionHandler {
      */
     private final LinkedHashMap<TopicPartition, TopicIdPartition> sessionPartitions;
 
-    /*
+    /**
      * The partitions to be included in the next ShareFetch request.
      */
     private LinkedHashMap<TopicPartition, TopicIdPartition> nextPartitions;
 
-    /*
+    /**
      * The acknowledgements to be included in the next ShareFetch/ShareAcknowledge request.
      */
     private LinkedHashMap<TopicIdPartition, Acknowledgements> nextAcknowledgements;
@@ -103,7 +103,15 @@ public class ShareSessionHandler {
         }
     }
 
-    public ShareFetchRequest.Builder newShareFetchBuilder(String groupId, FetchConfig fetchConfig) {
+    public void addPartitionToAcknowledgeOnly(TopicIdPartition topicIdPartition, Acknowledgements partitionAcknowledgements) {
+        nextAcknowledgements.put(topicIdPartition, partitionAcknowledgements);
+    }
+
+    public boolean isNewSession() {
+        return nextMetadata.isNewSession();
+    }
+
+    public ShareFetchRequest.Builder newShareFetchBuilder(String groupId, ShareFetchConfig shareFetchConfig) {
         List<TopicIdPartition> added = new ArrayList<>();
         List<TopicIdPartition> removed = new ArrayList<>();
         List<TopicIdPartition> replaced = new ArrayList<>();
@@ -170,12 +178,12 @@ public class ShareSessionHandler {
         nextAcknowledgements = new LinkedHashMap<>();
 
         return ShareFetchRequest.Builder.forConsumer(
-                groupId, nextMetadata, fetchConfig.maxWaitMs,
-                fetchConfig.minBytes, fetchConfig.maxBytes, fetchConfig.fetchSize,
-                added, removed, acknowledgementBatches);
+                groupId, nextMetadata, shareFetchConfig.maxWaitMs,
+                shareFetchConfig.minBytes, shareFetchConfig.maxBytes, shareFetchConfig.maxPollRecords,
+                shareFetchConfig.maxPollRecords, shareFetchConfig.shareAcquireMode.id, added, removed, acknowledgementBatches);
     }
 
-    public ShareAcknowledgeRequest.Builder newShareAcknowledgeBuilder(String groupId, FetchConfig fetchConfig) {
+    public ShareAcknowledgeRequest.Builder newShareAcknowledgeBuilder(String groupId, ShareFetchConfig shareFetchConfig) {
         if (nextMetadata.isNewSession()) {
             // A share session cannot be started with a ShareAcknowledge request
             nextPartitions.clear();
@@ -211,7 +219,8 @@ public class ShareSessionHandler {
      */
     public boolean handleResponse(ShareFetchResponse response, short version) {
         if ((response.error() == Errors.SHARE_SESSION_NOT_FOUND) ||
-                (response.error() == Errors.INVALID_SHARE_SESSION_EPOCH)) {
+                (response.error() == Errors.INVALID_SHARE_SESSION_EPOCH) ||
+                (response.error() == Errors.SHARE_SESSION_LIMIT_REACHED)) {
             log.info("Node {} was unable to process the ShareFetch request with {}: {}.",
                     node, nextMetadata, response.error());
             nextMetadata = nextMetadata.nextCloseExistingAttemptNew();

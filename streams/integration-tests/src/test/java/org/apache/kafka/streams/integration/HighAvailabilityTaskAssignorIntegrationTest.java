@@ -236,13 +236,13 @@ public class HighAvailabilityTaskAssignorIntegrationTest {
                     }
                 },
                 120_000L,
-                "Never saw a first assignment after scale out: " + assignmentsCompleted.get()
+                    () -> "Never saw a first assignment after scale out: " + assignmentsCompleted.get()
             );
 
             TestUtils.waitForCondition(
                 assignmentStable::get,
                 120_000L,
-                "Assignment hasn't become stable: " + assignmentsCompleted.get() +
+                    () -> "Assignment hasn't become stable: " + assignmentsCompleted.get() +
                     " Note, if this does fail, check and see if the new instance just failed to catch up within" +
                     " the probing rebalance interval. A full minute should be long enough to read ~500 records" +
                     " in any test environment, but you never know..."
@@ -287,11 +287,7 @@ public class HighAvailabilityTaskAssignorIntegrationTest {
     }
 
     private static String getKiloByteValue() {
-        final StringBuilder kiloBuilder = new StringBuilder(1000);
-        for (int i = 0; i < 1000; i++) {
-            kiloBuilder.append('0');
-        }
-        return kiloBuilder.toString();
+        return "0".repeat(1000);
     }
 
     private static void assertFalseNoRetry(final boolean assertion, final String message) {

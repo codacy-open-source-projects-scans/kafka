@@ -21,10 +21,10 @@ import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.compress.Compression;
 import org.apache.kafka.common.errors.CoordinatorLoadInProgressException;
 import org.apache.kafka.common.errors.NotCoordinatorException;
-import org.apache.kafka.common.errors.RecordTooLargeException;
 import org.apache.kafka.common.errors.TimeoutException;
 import org.apache.kafka.common.protocol.Errors;
 import org.apache.kafka.common.record.AbstractRecords;
+import org.apache.kafka.common.record.CompressionType;
 import org.apache.kafka.common.record.ControlRecordType;
 import org.apache.kafka.common.record.EndTransactionMarker;
 import org.apache.kafka.common.record.MemoryRecords;
@@ -39,8 +39,6 @@ import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.common.utils.Utils;
 import org.apache.kafka.deferred.DeferredEvent;
 import org.apache.kafka.deferred.DeferredEventQueue;
-import org.apache.kafka.image.MetadataDelta;
-import org.apache.kafka.image.MetadataImage;
 import org.apache.kafka.server.util.timer.Timer;
 import org.apache.kafka.server.util.timer.TimerTask;
 import org.apache.kafka.storage.internals.log.LogConfig;
@@ -52,7 +50,6 @@ import org.slf4j.Logger;
 import java.nio.ByteBuffer;
 import java.time.Duration;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
@@ -70,6 +67,7 @@ import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
+import static java.lang.Math.min;
 import static org.apache.kafka.coordinator.common.runtime.CoordinatorRuntime.CoordinatorWriteEvent.NOT_QUEUED;
 
 /**
@@ -401,7 +399,7 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
                             schedule(key, retryBackoff, TimeUnit.MILLISECONDS, true, retryBackoff, operation);
                         } else {
                             log.error("The write event {} for the timer {} failed due to {}. Ignoring it. ",
-                                event.name, key, ex.getMessage());
+                                event.name, key, ex.getMessage(), ex);
                         }
 
                         return null;
@@ -494,15 +492,15 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
         final MemoryRecordsBuilder builder;
 
         /**
-         * The timer used to enfore the append linger time if
+         * The timer used to enforce the append linger time if
          * it is non-zero.
          */
         final Optional<TimerTask> lingerTimeoutTask;
 
         /**
-         * The list of deferred events associated with the batch.
+         * The deferred events associated with the batch.
          */
-        final List<DeferredEvent> deferredEvents;
+        final DeferredEventCollection deferredEvents;
 
         /**
          * The next offset. This is updated when records
@@ -511,6 +509,7 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
         long nextOffset;
 
         CoordinatorBatch(
+            Logger log,
             long baseOffset,
             long appendTimeMs,
             int maxBatchSize,
@@ -527,7 +526,7 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
             this.buffer = buffer;
             this.builder = builder;
             this.lingerTimeoutTask = lingerTimeoutTask;
-            this.deferredEvents = new ArrayList<>();
+            this.deferredEvents = new DeferredEventCollection(log);
         }
     }
 
@@ -718,7 +717,7 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
                             }
                         } catch (Throwable ex) {
                             log.error("Failed to load metadata from {} with epoch {} due to {}.",
-                                tp, epoch, ex.toString());
+                                tp, epoch, ex.getMessage(), ex);
                             context.transitionTo(CoordinatorState.FAILED);
                         }
                     } else {
@@ -742,7 +741,11 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
             deferredEventQueue.failAll(Errors.NOT_COORDINATOR.exception());
             failCurrentBatch(Errors.NOT_COORDINATOR.exception());
             if (coordinator != null) {
-                coordinator.onUnloaded();
+                try {
+                    coordinator.onUnloaded();
+                } catch (Throwable ex) {
+                    log.error("Failed to unload coordinator for {} due to {}.", tp, ex.getMessage(), ex);
+                }
             }
             coordinator = null;
         }
@@ -754,8 +757,14 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
             // Cancel the linger timeout.
             currentBatch.lingerTimeoutTask.ifPresent(TimerTask::cancel);
 
-            // Release the buffer.
-            bufferSupplier.release(currentBatch.buffer);
+            // Release the buffer only if it is not larger than the maxBatchSize.
+            int maxBatchSize = partitionWriter.config(tp).maxMessageSize();
+
+            if (currentBatch.builder.buffer().capacity() <= maxBatchSize) {
+                bufferSupplier.release(currentBatch.builder.buffer());
+            } else if (currentBatch.buffer.capacity() <= maxBatchSize) {
+                bufferSupplier.release(currentBatch.buffer);
+            }
 
             currentBatch = null;
         }
@@ -806,14 +815,12 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
                     }
 
                     // Add all the pending deferred events to the deferred event queue.
-                    for (DeferredEvent event : currentBatch.deferredEvents) {
-                        deferredEventQueue.add(offset, event);
-                    }
+                    deferredEventQueue.add(offset, currentBatch.deferredEvents);
 
                     // Free up the current batch.
                     freeCurrentBatch();
                 } catch (Throwable t) {
-                    log.error("Writing records to {} failed due to: {}.", tp, t.getMessage());
+                    log.error("Writing records to {} failed due to: {}.", tp, t.getMessage(), t);
                     failCurrentBatch(t);
                     // We rethrow the exception for the caller to handle it too.
                     throw t;
@@ -822,11 +829,11 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
         }
 
         /**
-         * Flushes the current batch if it is transactional or if it has passed the append linger time.
+         * Flushes the current batch if it is transactional, if it has passed the append linger time, or if it is full.
          */
         private void maybeFlushCurrentBatch(long currentTimeMs) {
             if (currentBatch != null) {
-                if (currentBatch.builder.isTransactional() || (currentBatch.appendTimeMs - currentTimeMs) >= appendLingerMs) {
+                if (currentBatch.builder.isTransactional() || (currentTimeMs - currentBatch.appendTimeMs) >= appendLingerMs || !currentBatch.builder.hasRoomFor(0)) {
                     flushCurrentBatch();
                 }
             }
@@ -839,9 +846,7 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
         private void failCurrentBatch(Throwable t) {
             if (currentBatch != null) {
                 coordinator.revertLastWrittenOffset(currentBatch.baseOffset);
-                for (DeferredEvent event : currentBatch.deferredEvents) {
-                    event.complete(t);
-                }
+                currentBatch.deferredEvents.complete(t);
                 freeCurrentBatch();
             }
         }
@@ -857,14 +862,13 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
         ) {
             if (currentBatch == null) {
                 LogConfig logConfig = partitionWriter.config(tp);
-                byte magic = logConfig.recordVersion().value;
                 int maxBatchSize = logConfig.maxMessageSize();
                 long prevLastWrittenOffset = coordinator.lastWrittenOffset();
-                ByteBuffer buffer = bufferSupplier.get(maxBatchSize);
+                ByteBuffer buffer = bufferSupplier.get(min(INITIAL_BUFFER_SIZE, maxBatchSize));
 
                 MemoryRecordsBuilder builder = new MemoryRecordsBuilder(
                     buffer,
-                    magic,
+                    RecordBatch.CURRENT_MAGIC_VALUE,
                     compression,
                     TimestampType.CREATE_TIME,
                     0L,
@@ -895,6 +899,7 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
                 }
 
                 currentBatch = new CoordinatorBatch(
+                    log,
                     prevLastWrittenOffset,
                     currentTimeMs,
                     maxBatchSize,
@@ -903,6 +908,24 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
                     builder,
                     lingerTimeoutTask
                 );
+            }
+        }
+
+        /**
+         * Completes the given event once all pending writes are completed. 
+         *
+         * @param event             The event to complete once all pending 
+         *                          writes are completed.
+         */
+        private void waitForPendingWrites(DeferredEvent event) {
+            if (currentBatch != null && currentBatch.builder.numRecords() > 0) {
+                currentBatch.deferredEvents.add(event);
+            } else {
+                if (coordinator.lastCommittedOffset() < coordinator.lastWrittenOffset()) {
+                    deferredEventQueue.add(coordinator.lastWrittenOffset(), DeferredEventCollection.of(log, event));
+                } else {
+                    event.complete(null);
+                }
             }
         }
 
@@ -935,17 +958,8 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
 
             if (records.isEmpty()) {
                 // If the records are empty, it was a read operation after all. In this case,
-                // the response can be returned directly iff there are no pending write operations;
-                // otherwise, the read needs to wait on the last write operation to be completed.
-                if (currentBatch != null && currentBatch.builder.numRecords() > 0) {
-                    currentBatch.deferredEvents.add(event);
-                } else {
-                    if (coordinator.lastCommittedOffset() < coordinator.lastWrittenOffset()) {
-                        deferredEventQueue.add(coordinator.lastWrittenOffset(), event);
-                    } else {
-                        event.complete(null);
-                    }
-                }
+                // the response can be returned once any pending write operations complete.
+                waitForPendingWrites(event);
             } else {
                 // If the records are not empty, first, they are applied to the state machine,
                 // second, they are appended to the opened batch.
@@ -979,27 +993,18 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
                 }
 
                 if (isAtomic) {
-                    // Compute the estimated size of the records.
-                    int estimatedSize = AbstractRecords.estimateSizeInBytes(
+                    // Compute the size of the records.
+                    int estimatedSizeUpperBound = AbstractRecords.estimateSizeInBytes(
                         currentBatch.builder.magic(),
-                        compression.type(),
+                        CompressionType.NONE,
                         recordsToAppend
                     );
 
-                    // Check if the current batch has enough space. We check this before
-                    // replaying the records in order to avoid having to revert back
-                    // changes if the records do not fit within a batch.
-                    if (estimatedSize > currentBatch.builder.maxAllowedBytes()) {
-                        throw new RecordTooLargeException("Message batch size is " + estimatedSize +
-                            " bytes in append to partition " + tp + " which exceeds the maximum " +
-                            "configured size of " + currentBatch.maxBatchSize + ".");
-                    }
-
-                    if (!currentBatch.builder.hasRoomFor(estimatedSize)) {
-                        // Otherwise, we write the current batch, allocate a new one and re-verify
-                        // whether the records fit in it.
-                        // If flushing fails, we don't catch the exception in order to let
-                        // the caller fail the current operation.
+                    if (!currentBatch.builder.hasRoomFor(estimatedSizeUpperBound)) {
+                        // Start a new batch when the total uncompressed data size would exceed
+                        // the max batch size. We still allow atomic writes with an uncompressed size
+                        // larger than the max batch size as long as they compress down to under the max
+                        // batch size. These large writes go into a batch by themselves.
                         flushCurrentBatch();
                         maybeAllocateNewBatch(
                             producerId,
@@ -1052,7 +1057,7 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
                         currentBatch.builder.append(recordToAppend);
                         currentBatch.nextOffset++;
                     } catch (Throwable t) {
-                        log.error("Replaying record {} to {} failed due to: {}.", recordToReplay, tp, t.getMessage());
+                        log.error("Replaying record {} to {} failed due to: {}.", recordToReplay, tp, t.getMessage(), t);
 
                         // Add the event to the list of pending events associated with the last
                         // batch in order to fail it too.
@@ -1070,8 +1075,8 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
                 // Add the event to the list of pending events associated with the batch.
                 currentBatch.deferredEvents.add(event);
 
-                // Write the current batch if it is transactional or if the linger timeout
-                // has expired.
+                // Write the current batch if it is transactional, if the linger timeout
+                // has expired, or if it is full. 
                 // If flushing fails, we don't catch the exception in order to let
                 // the caller fail the current operation.
                 maybeFlushCurrentBatch(currentTimeMs);
@@ -1128,7 +1133,7 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
                 runtimeMetrics.recordFlushTime(time.milliseconds() - flushStartMs);
                 coordinator.updateLastWrittenOffset(offset);
 
-                deferredEventQueue.add(offset, event);
+                deferredEventQueue.add(offset, DeferredEventCollection.of(log, event));
             } catch (Throwable t) {
                 coordinator.revertLastWrittenOffset(prevLastWrittenOffset);
                 event.complete(t);
@@ -1155,6 +1160,58 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
             String name = event.toString();
             scheduleInternalOperation("OperationTimeout(name=" + name + ", tp=" + tp + ")", tp,
                 () -> event.complete(new TimeoutException(name + " timed out after " + delayMs + "ms")));
+        }
+    }
+
+    /**
+     * A collection of {@link DeferredEvent}. When completed, completes all the events in the collection
+     * and logs any exceptions thrown.
+     */
+    static class DeferredEventCollection implements DeferredEvent {
+        /**
+         * The logger.
+         */
+        private final Logger log;
+
+        /**
+         * The list of events.
+         */
+        private final List<DeferredEvent> events = new ArrayList<>();
+
+        public DeferredEventCollection(Logger log) {
+            this.log = log;
+        }
+
+        @Override
+        public void complete(Throwable t) {
+            for (DeferredEvent event : events) {
+                try {
+                    event.complete(t);
+                } catch (Throwable e) {
+                    log.error("Completion of event {} failed due to {}.", event, e.getMessage(), e);
+                }
+            }
+        }
+
+        public boolean add(DeferredEvent event) {
+            return events.add(event);
+        }
+
+        public int size() {
+            return events.size();
+        }
+
+        @Override
+        public String toString() {
+            return "DeferredEventCollection(events=" + events + ")";
+        }
+
+        public static DeferredEventCollection of(Logger log, DeferredEvent... deferredEvents) {
+            DeferredEventCollection collection = new DeferredEventCollection(log);
+            for (DeferredEvent deferredEvent : deferredEvents) {
+                collection.add(deferredEvent);
+            }
+            return collection;
         }
     }
 
@@ -1857,19 +1914,14 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
     }
 
     /**
-     * 16KB. Used for initial buffer size for write operations.
+     * 512KB. Used for initial buffer size for write operations.
      */
-    static final int MIN_BUFFER_SIZE = 16384;
+    static final int INITIAL_BUFFER_SIZE = 512 * 1024;
 
     /**
      * The log prefix.
      */
     private final String logPrefix;
-
-    /**
-     * The log context.
-     */
-    private final LogContext logContext;
 
     /**
      * The logger.
@@ -1957,7 +2009,7 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
     /**
      * The latest known metadata image.
      */
-    private volatile MetadataImage metadataImage = MetadataImage.EMPTY;
+    private volatile CoordinatorMetadataImage metadataImage = CoordinatorMetadataImage.EMPTY;
 
     /**
      * Constructor.
@@ -1997,7 +2049,6 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
         ExecutorService executorService
     ) {
         this.logPrefix = logPrefix;
-        this.logContext = logContext;
         this.log = logContext.logger(CoordinatorRuntime.class);
         this.time = time;
         this.timer = timer;
@@ -2184,7 +2235,7 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
         short producerEpoch,
         Duration timeout,
         CoordinatorWriteOperation<S, T, U> op,
-        Short apiVersion
+        int apiVersion
     ) {
         throwIfNotRunning();
         log.debug("Scheduled execution of transactional write operation {}.", name);
@@ -2388,9 +2439,19 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
                 try {
                     if (partitionEpoch.isEmpty() || context.epoch < partitionEpoch.getAsInt()) {
                         log.info("Started unloading metadata for {} with epoch {}.", tp, partitionEpoch);
-                        context.transitionTo(CoordinatorState.CLOSED);
-                        coordinators.remove(tp, context);
-                        log.info("Finished unloading metadata for {} with epoch {}.", tp, partitionEpoch);
+                        try {
+                            context.transitionTo(CoordinatorState.CLOSED);
+                            log.info("Finished unloading metadata for {} with epoch {}.", tp, partitionEpoch);
+                        } catch (Throwable ex) {
+                            // It's very unlikely that we will ever see an exception here, since we
+                            // already make an effort to catch exceptions in the unload method.
+                            log.error("Failed to unload metadata for {} with epoch {} due to {}.",
+                                tp, partitionEpoch, ex.getMessage(), ex);
+                        } finally {
+                            // Always remove the coordinator context, otherwise the coordinator
+                            // shard could be permanently stuck.
+                            coordinators.remove(tp, context);
+                        }
                     } else {
                         log.info("Ignored unloading metadata for {} in epoch {} since current epoch is {}.",
                             tp, partitionEpoch, context.epoch);
@@ -2412,18 +2473,18 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
      * @param delta     The metadata delta.
      */
     public void onNewMetadataImage(
-        MetadataImage newImage,
-        MetadataDelta delta
+        CoordinatorMetadataImage newImage,
+        CoordinatorMetadataDelta delta
     ) {
         throwIfNotRunning();
-        log.debug("Scheduling applying of a new metadata image with offset {}.", newImage.offset());
+        log.debug("Scheduling applying of a new metadata image with version {}.", newImage.version());
 
         // Update global image.
         metadataImage = newImage;
 
         // Push an event for each coordinator.
         coordinators.keySet().forEach(tp -> {
-            scheduleInternalOperation("UpdateImage(tp=" + tp + ", offset=" + newImage.offset() + ")", tp, () -> {
+            scheduleInternalOperation("UpdateImage(tp=" + tp + ", version=" + newImage.version() + ")", tp, () -> {
                 CoordinatorContext context = coordinators.get(tp);
                 if (context != null) {
                     context.lock.lock();
@@ -2431,18 +2492,18 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
                         if (context.state == CoordinatorState.ACTIVE) {
                             // The new image can be applied to the coordinator only if the coordinator
                             // exists and is in the active state.
-                            log.debug("Applying new metadata image with offset {} to {}.", newImage.offset(), tp);
+                            log.debug("Applying new metadata image with version {} to {}.", newImage.version(), tp);
                             context.coordinator.onNewMetadataImage(newImage, delta);
                         } else {
-                            log.debug("Ignored new metadata image with offset {} for {} because the coordinator is not active.",
-                                newImage.offset(), tp);
+                            log.debug("Ignored new metadata image with version {} for {} because the coordinator is not active.",
+                                newImage.version(), tp);
                         }
                     } finally {
                         context.lock.unlock();
                     }
                 } else {
-                    log.debug("Ignored new metadata image with offset {} for {} because the coordinator does not exist.",
-                        newImage.offset(), tp);
+                    log.debug("Ignored new metadata image with version {} for {} because the coordinator does not exist.",
+                        newImage.version(), tp);
                 }
             });
         });
@@ -2471,6 +2532,8 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
             context.lock.lock();
             try {
                 context.transitionTo(CoordinatorState.CLOSED);
+            } catch (Throwable ex) {
+                log.warn("Failed to unload metadata for {} due to {}.", tp, ex.getMessage(), ex);
             } finally {
                 context.lock.unlock();
             }
@@ -2491,7 +2554,7 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
      */
     public List<TopicPartition> activeTopicPartitions() {
         if (coordinators == null || coordinators.isEmpty()) {
-            return Collections.emptyList();
+            return List.of();
         }
 
         return coordinators.entrySet().stream()

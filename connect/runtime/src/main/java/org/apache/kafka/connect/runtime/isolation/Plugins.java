@@ -42,9 +42,7 @@ import org.slf4j.LoggerFactory;
 
 import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collection;
-import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -80,7 +78,7 @@ public class Plugins {
     }
 
     public PluginScanResult initLoaders(Set<PluginSource> pluginSources, PluginDiscoveryMode discoveryMode) {
-        PluginScanResult empty = new PluginScanResult(Collections.emptyList());
+        PluginScanResult empty = new PluginScanResult(List.of());
         PluginScanResult serviceLoadingScanResult;
         try {
             serviceLoadingScanResult = discoveryMode.serviceLoad() ?
@@ -93,7 +91,7 @@ public class Plugins {
         }
         PluginScanResult reflectiveScanResult = discoveryMode.reflectivelyScan() ?
                 new ReflectionScanner().discoverPlugins(pluginSources) : empty;
-        PluginScanResult scanResult = new PluginScanResult(Arrays.asList(reflectiveScanResult, serviceLoadingScanResult));
+        PluginScanResult scanResult = new PluginScanResult(List.of(reflectiveScanResult, serviceLoadingScanResult));
         maybeReportHybridDiscoveryIssue(discoveryMode, serviceLoadingScanResult, scanResult);
         delegatingLoader.installDiscoveredPlugins(scanResult);
         return scanResult;
@@ -165,7 +163,6 @@ public class Plugins {
         );
     }
 
-    @SuppressWarnings("unchecked")
     protected static <U> Class<? extends U> pluginClass(
             DelegatingClassLoader loader,
             String classOrAlias,
@@ -265,34 +262,30 @@ public class Plugins {
         };
     }
 
-    public String latestVersion(String classOrAlias) {
-        return delegatingLoader.latestVersion(classOrAlias);
+    public String latestVersion(String classOrAlias, PluginType... allowedTypes) {
+        return pluginVersion(classOrAlias, null, allowedTypes);
     }
 
-    public String pluginVersion(String classOrAlias, ClassLoader sourceLoader) {
-        if (!(sourceLoader instanceof PluginClassLoader)) {
-            return latestVersion(classOrAlias);
+    public String pluginVersion(String classOrAlias, ClassLoader sourceLoader, PluginType... allowedTypes) {
+        String location = (sourceLoader instanceof PluginClassLoader) ? ((PluginClassLoader) sourceLoader).location() : null;
+        PluginDesc<?> desc = delegatingLoader.pluginDesc(classOrAlias, location, Set.of(allowedTypes));
+        if (desc != null) {
+            return desc.version();
         }
-        return delegatingLoader.versionInLocation(classOrAlias, ((PluginClassLoader) sourceLoader).location());
+        return null;
     }
 
     public DelegatingClassLoader delegatingLoader() {
         return delegatingLoader;
     }
 
-    // kept for compatibility
-    public ClassLoader connectorLoader(String connectorClassOrAlias) {
-        return delegatingLoader.loader(connectorClassOrAlias);
+    public ClassLoader connectorLoader(String connectorClassOrAlias, VersionRange range) {
+        return delegatingLoader.connectorLoader(connectorClassOrAlias, range);
     }
 
-    public ClassLoader pluginLoader(String classOrAlias, VersionRange range) {
-        return delegatingLoader.loader(classOrAlias, range);
+    public ClassLoader pluginLoader(String classOrAlias, VersionRange range, ClassLoader connectorLoader) {
+        return delegatingLoader.pluginLoader(classOrAlias, range, connectorLoader);
     }
-
-    public ClassLoader pluginLoader(String classOrAlias) {
-        return delegatingLoader.loader(classOrAlias);
-    }
-
 
     @SuppressWarnings({"unchecked", "rawtypes"})
     public Set<PluginDesc<Connector>> connectors() {
@@ -364,19 +357,14 @@ public class Plugins {
         return plugins;
     }
 
-    public Object newPlugin(String classOrAlias) throws ClassNotFoundException {
-        Class<?> klass = pluginClass(delegatingLoader, classOrAlias, Object.class);
-        return newPlugin(klass);
-    }
-
     public Object newPlugin(String classOrAlias, VersionRange range) throws VersionedPluginLoadingException, ClassNotFoundException {
         Class<?> klass = pluginClass(delegatingLoader, classOrAlias, Object.class, range);
         return newPlugin(klass);
     }
 
     public Object newPlugin(String classOrAlias, VersionRange range, ClassLoader sourceLoader) throws ClassNotFoundException {
-        if (range == null && sourceLoader instanceof PluginClassLoader) {
-            sourceLoader.loadClass(classOrAlias);
+        if (sourceLoader instanceof PluginClassLoader) {
+            return newPlugin(pluginLoader(classOrAlias, range, sourceLoader).loadClass(classOrAlias));
         }
         return newPlugin(classOrAlias, range);
     }
@@ -546,7 +534,7 @@ public class Plugins {
     }
 
     private HeaderConverter newHeaderConverter(AbstractConfig config, String classPropertyName, String versionPropertyName, ClassLoaderUsage classLoaderUsage) {
-        if (!config.originals().containsKey(classPropertyName) && classLoaderUsage == ClassLoaderUsage.CURRENT_CLASSLOADER) {
+        if (config.getClass(classPropertyName) == null && classLoaderUsage == ClassLoaderUsage.CURRENT_CLASSLOADER) {
             // This configuration does not define the Header Converter via the specified property name
             return null;
         }
@@ -599,7 +587,7 @@ public class Plugins {
                 // if the config specifies the class name, use it, otherwise use the default which we can get from config.getClass
                 String classOrAlias = config.originalsStrings().get(classPropertyName);
                 if (classOrAlias == null) {
-                    classOrAlias = config.getClass(classPropertyName).getName();
+                    classOrAlias = config.getClass(classPropertyName) == null ? null : config.getClass(classPropertyName).getName();
                 }
                 try {
                     klass = pluginClass(delegatingLoader, classOrAlias, basePluginClass, range);
@@ -675,8 +663,7 @@ public class Plugins {
         }
         try (LoaderSwap loaderSwap = withClassLoader(klass.getClassLoader())) {
             plugin = newPlugin(klass);
-            if (plugin instanceof Versioned) {
-                Versioned versionedPlugin = (Versioned) plugin;
+            if (plugin instanceof Versioned versionedPlugin) {
                 if (Utils.isBlank(versionedPlugin.version())) {
                     throw new ConnectException("Version not defined for '" + klassName + "'");
                 }

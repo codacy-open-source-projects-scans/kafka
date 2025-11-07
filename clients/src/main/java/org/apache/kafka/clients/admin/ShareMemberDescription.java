@@ -20,6 +20,7 @@ import org.apache.kafka.common.annotation.InterfaceStability;
 
 import java.util.Collections;
 import java.util.Objects;
+import java.util.Optional;
 
 /**
  * A detailed description of a single share group member in the cluster.
@@ -27,21 +28,27 @@ import java.util.Objects;
 @InterfaceStability.Evolving
 public class ShareMemberDescription {
     private final String memberId;
+    private final Optional<String> rackId;
     private final String clientId;
     private final String host;
     private final ShareMemberAssignment assignment;
+    private final int memberEpoch;
 
     public ShareMemberDescription(
         String memberId,
+        Optional<String> rackId,
         String clientId,
         String host,
-        ShareMemberAssignment assignment
+        ShareMemberAssignment assignment,
+        int memberEpoch
     ) {
         this.memberId = memberId == null ? "" : memberId;
+        this.rackId = rackId;
         this.clientId = clientId == null ? "" : clientId;
         this.host = host == null ? "" : host;
         this.assignment = assignment == null ?
             new ShareMemberAssignment(Collections.emptySet()) : assignment;
+        this.memberEpoch = memberEpoch;
     }
 
     @Override
@@ -50,14 +57,16 @@ public class ShareMemberDescription {
         if (o == null || getClass() != o.getClass()) return false;
         ShareMemberDescription that = (ShareMemberDescription) o;
         return memberId.equals(that.memberId) &&
+            rackId.equals(that.rackId) &&
             clientId.equals(that.clientId) &&
             host.equals(that.host) &&
-            assignment.equals(that.assignment);
+            assignment.equals(that.assignment) &&
+            memberEpoch == that.memberEpoch;
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(memberId, clientId, host, assignment);
+        return Objects.hash(memberId, rackId, clientId, host, assignment, memberEpoch);
     }
 
     /**
@@ -65,6 +74,13 @@ public class ShareMemberDescription {
      */
     public String consumerId() {
         return memberId;
+    }
+
+    /**
+     * The rack id of the group member.
+     */
+    public Optional<String> rackId() {
+        return rackId;
     }
 
     /**
@@ -88,11 +104,21 @@ public class ShareMemberDescription {
         return assignment;
     }
 
+    /**
+     * The epoch of the group member.
+     */
+    public int memberEpoch() {
+        return memberEpoch;
+    }
+
     @Override
     public String toString() {
         return "(memberId=" + memberId +
+            ", rackId=" + rackId.orElse("null") +
             ", clientId=" + clientId +
             ", host=" + host +
-            ", assignment=" + assignment + ")";
+            ", assignment=" + assignment +
+            ", memberEpoch=" + memberEpoch +
+            ")";
     }
 }
