@@ -14,28 +14,15 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package org.apache.kafka.coordinator.common.runtime;
-
-import java.util.concurrent.RejectedExecutionException;
+package org.apache.kafka.storage.internals.log;
 
 /**
- * A {@link CoordinatorEvent} processor.
+ * This class tracks resource usage during broker record validation for eventual reporting in metrics.
+ * Record validation covers integrity checks on inbound data (e.g. checksum verification), structural
+ * validation to make sure that records are well-formed, and conversion between record formats if needed.
  */
-public interface CoordinatorEventProcessor extends AutoCloseable {
+public record RecordValidationStats(long temporaryMemoryBytes, int numRecordsConverted, long conversionTimeNanos) {
 
-    /**
-     * Enqueues a new {@link CoordinatorEvent} at the end of the processor.
-     *
-     * @param event The event.
-     * @throws RejectedExecutionException If the event processor is closed.
-     */
-    void enqueueLast(CoordinatorEvent event) throws RejectedExecutionException;
+    public static final RecordValidationStats EMPTY = new RecordValidationStats(0, 0, 0);
 
-    /**
-     * Enqueues a new {@link CoordinatorEvent} at the front of the processor.
-     *
-     * @param event The event.
-     * @throws RejectedExecutionException If the event processor is closed.
-     */
-    void enqueueFirst(CoordinatorEvent event) throws RejectedExecutionException;
 }
