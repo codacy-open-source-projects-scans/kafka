@@ -35,7 +35,7 @@ import org.apache.kafka.common.record.internal._
 import org.apache.kafka.common.requests._
 import org.apache.kafka.common.resource.{PatternType, ResourceType => AdminResourceType}
 import org.apache.kafka.common.security.auth._
-import org.apache.kafka.common.utils.SecurityUtils
+import org.apache.kafka.common.utils.internals.SecurityUtils
 import org.apache.kafka.common.utils.internals.Sanitizer
 import org.apache.kafka.coordinator.group.GroupCoordinatorConfig
 import org.apache.kafka.metadata.authorizer.StandardAuthorizer
@@ -666,6 +666,9 @@ class RequestQuotaTest extends BaseRequestTest {
         case ApiKeys.UNREGISTER_BROKER =>
           new UnregisterBrokerRequest.Builder(new UnregisterBrokerRequestData())
 
+        case ApiKeys.UNREGISTER_CONTROLLER =>
+          new UnregisterControllerRequest.Builder(new UnregisterControllerRequestData())
+
         case ApiKeys.DESCRIBE_TRANSACTIONS =>
           new DescribeTransactionsRequest.Builder(new DescribeTransactionsRequestData()
             .setTransactionalIds(util.List.of("test-transactional-id")))
@@ -757,6 +760,9 @@ class RequestQuotaTest extends BaseRequestTest {
 
         case ApiKeys.STREAMS_GROUP_DESCRIBE =>
           new StreamsGroupDescribeRequest.Builder(new StreamsGroupDescribeRequestData())
+
+        case ApiKeys.STREAMS_GROUP_TOPOLOGY_DESCRIPTION_UPDATE =>
+          new StreamsGroupTopologyDescriptionUpdateRequest.Builder(new StreamsGroupTopologyDescriptionUpdateRequestData())
 
         case ApiKeys.DESCRIBE_SHARE_GROUP_OFFSETS =>
           new DescribeShareGroupOffsetsRequest.Builder(new DescribeShareGroupOffsetsRequestData())

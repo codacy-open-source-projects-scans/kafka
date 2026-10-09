@@ -19,7 +19,6 @@ package org.apache.kafka.clients.consumer;
 import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.clients.admin.NewPartitionReassignment;
 import org.apache.kafka.clients.admin.NewPartitions;
-import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.clients.consumer.internals.AbstractHeartbeatRequestManager;
 import org.apache.kafka.clients.producer.Producer;
 import org.apache.kafka.clients.producer.ProducerConfig;
@@ -242,7 +241,7 @@ public class ConsumerIntegrationTest {
                 @ClusterConfigProperty(id = 2, key = "broker.rack", value = "rack2"),
                 @ClusterConfigProperty(key = GroupCoordinatorConfig.CONSUMER_GROUP_HEARTBEAT_INTERVAL_MS_CONFIG, value = "1000"),
                 @ClusterConfigProperty(key = GroupCoordinatorConfig.CONSUMER_GROUP_MIN_HEARTBEAT_INTERVAL_MS_CONFIG, value = "1000"),
-                @ClusterConfigProperty(key = GroupCoordinatorConfig.CONSUMER_GROUP_ASSIGNORS_CONFIG, value = "org.apache.kafka.clients.consumer.RackAwareAssignor"),
+                @ClusterConfigProperty(key = GroupCoordinatorConfig.CONSUMER_GROUP_ASSIGNORS_CONFIG, value = "org.apache.kafka.clients.consumer.RackAwareTestAssignor"),
                 @ClusterConfigProperty(key = GroupCoordinatorConfig.CONSUMER_GROUP_ASSIGNMENT_INTERVAL_MS_CONFIG, value = "0")
             }
         ),
@@ -255,13 +254,15 @@ public class ConsumerIntegrationTest {
                 @ClusterConfigProperty(id = 2, key = "broker.rack", value = "rack2"),
                 @ClusterConfigProperty(key = GroupCoordinatorConfig.CONSUMER_GROUP_HEARTBEAT_INTERVAL_MS_CONFIG, value = "1000"),
                 @ClusterConfigProperty(key = GroupCoordinatorConfig.CONSUMER_GROUP_MIN_HEARTBEAT_INTERVAL_MS_CONFIG, value = "1000"),
-                @ClusterConfigProperty(key = GroupCoordinatorConfig.CONSUMER_GROUP_ASSIGNORS_CONFIG, value = "org.apache.kafka.clients.consumer.RackAwareAssignor"),
+                @ClusterConfigProperty(key = GroupCoordinatorConfig.CONSUMER_GROUP_ASSIGNORS_CONFIG, value = "org.apache.kafka.clients.consumer.RackAwareTestAssignor"),
                 @ClusterConfigProperty(key = GroupCoordinatorConfig.CONSUMER_GROUP_ASSIGNMENT_INTERVAL_MS_CONFIG, value = "1000")
             }
         )
     })
     public void testRackAwareAssignment(ClusterInstance clusterInstance) throws ExecutionException, InterruptedException {
+        // Create a new topic with 1 partition on broker 0.
         String topic = "test-topic";
+        clusterInstance.createTopicWithAssignment(topic, Map.of(0, List.of(0)));
         try (Admin admin = clusterInstance.admin();
              Producer<byte[], byte[]> producer = clusterInstance.producer();
              Consumer<byte[], byte[]> consumer0 = clusterInstance.consumer(Map.of(
@@ -283,10 +284,6 @@ public class ConsumerIntegrationTest {
                  ConsumerConfig.GROUP_PROTOCOL_CONFIG, GroupProtocol.CONSUMER.name()
              ))
         ) {
-            // Create a new topic with 1 partition on broker 0.
-            admin.createTopics(List.of(new NewTopic(topic, Map.of(0, List.of(0)))));
-            clusterInstance.waitTopicCreation(topic, 1);
-
             producer.send(new ProducerRecord<>(topic, "key".getBytes(), "value".getBytes()));
             producer.flush();
 
@@ -376,9 +373,7 @@ public class ConsumerIntegrationTest {
             producer.send(new ProducerRecord<>("topic", "value".getBytes(StandardCharsets.UTF_8)));
         }
 
-        try (var admin = clusterInstance.admin()) {
-            admin.createTopics(List.of(new NewTopic(Topic.GROUP_METADATA_TOPIC_NAME, Map.of(0, List.of(0))))).all().get();
-        }
+        clusterInstance.createTopicWithAssignment(Topic.GROUP_METADATA_TOPIC_NAME, Map.of(0, List.of(0)));
 
         try (var consumer = clusterInstance.consumer(Map.of(ConsumerConfig.GROUP_ID_CONFIG, "test-group"));
             var admin = clusterInstance.admin()) {

@@ -56,8 +56,8 @@ import org.apache.kafka.common.requests.OffsetsForLeaderEpochRequest;
 import org.apache.kafka.common.requests.OffsetsForLeaderEpochResponse;
 import org.apache.kafka.common.requests.RequestTestUtils;
 import org.apache.kafka.common.serialization.ByteArrayDeserializer;
-import org.apache.kafka.common.utils.LogContext;
 import org.apache.kafka.common.utils.MockTime;
+import org.apache.kafka.common.utils.internals.LogContext;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -659,12 +659,8 @@ public class OffsetFetcherTest {
         consumerClient.pollNoWakeup();
         assertFalse(subscriptions.hasValidPosition(tp0));
 
-        try {
-            offsetFetcher.resetPositionsIfNeeded();
-            fail("Expected authorization error to be raised");
-        } catch (TopicAuthorizationException e) {
-            assertEquals(singleton(tp0.topic()), e.unauthorizedTopics());
-        }
+        TopicAuthorizationException e = assertThrows(TopicAuthorizationException.class, () -> offsetFetcher.resetPositionsIfNeeded(), "Expected authorization error to be raised");
+        assertEquals(singleton(tp0.topic()), e.unauthorizedTopics());
 
         // The exception should clear after being raised, but no retry until the backoff
         offsetFetcher.resetPositionsIfNeeded();
